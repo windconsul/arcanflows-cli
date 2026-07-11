@@ -151,13 +151,29 @@ export function formatDate(d: Date): string { ... }
 --- End file ---
 ```
 
+For edits to existing files, the agent can send a **targeted search/replace** instead of rewriting the whole file — each `SEARCH` must match exactly one place (a not-found or ambiguous match is reported back so the agent can retry):
+
+```
+--- Replace in: src/utils/helper.ts ---
+<<<<<<< SEARCH
+return d.toISOString()
+=======
+return d.toISOString().slice(0, 10)
+>>>>>>> REPLACE
+--- End replace ---
+```
+
+Edits are applied atomically (temp file + rename), preserve the file's permissions, and are shown as an accurate diff before you approve. `/undo` reverses the last operation precisely (including undoing a newly-created file) via an operation journal in `.arcanflows/backups/`.
+
 The agent can also suggest shell commands:
 
 ```
 EXECUTE: npm install express
 ```
 
-Both require confirmation before execution. Protected paths (`.env`, `*.key`, `*.pem`) are never modified.
+**Agentic loop:** after you approve and the CLI applies file edits or runs commands, their results (exit codes, output, errors) are sent back to the agent automatically, and it continues — so it can build, see a failure, and fix it within a single turn. The loop is bounded by `chat_max_tool_iterations` (default 8) and stops as soon as the agent has no more actions. Press **Ctrl+C** to cancel the current turn and return to the prompt.
+
+Both require confirmation before execution. File operations are **confined to the project directory** by default (use `--allow-outside` to override), and protected paths (`.env*`, `*.key`, `*.pem`, `*.p8`, `id_rsa`, `credentials*`, `secrets*`, the `.git` tree, …) are never modified. The confirmation prompt is the real safety boundary — review each action before approving.
 
 ### Ask
 
@@ -369,11 +385,10 @@ pre_commit:
 |-------|------------|
 | `pre_chat` | Before chat session starts (output injected into context) |
 | `post_chat` | After chat session ends |
-| `pre_edit` / `post_edit` | Before/after agent edits a file |
-| `pre_create` / `post_create` | Before/after agent creates a file |
-| `pre_delete` / `post_delete` | Before/after agent deletes a file |
+| `pre_edit` / `post_edit` | Before/after agent edits a file (a failing `pre_edit` blocks the edit) |
+| `pre_create` / `post_create` | Before/after agent creates a file (a failing `pre_create` blocks it) |
+| `pre_delete` / `post_delete` | Before/after agent deletes a file (a failing `pre_delete` blocks it) |
 | `pre_run` / `post_run` | Before/after shell command execution |
-| `pre_commit` / `post_commit` | Before/after git commit |
 
 ### Template Variables
 
@@ -425,6 +440,7 @@ settings:
   chat_markdown: true
   chat_syntax_highlight: true
   chat_max_history: 50
+  chat_max_tool_iterations: 8       # agent-loop cap per turn (file/shell → results → continue)
   repo_max_file_size: 100000           # bytes
   repo_max_files: 200
   repo_exclude_patterns:
@@ -568,10 +584,13 @@ API keys are scoped to a single tenant and inherit the creating user's permissio
 
 - Credentials stored in `~/.arcanflows/credentials.yaml` with 0600 permissions
 - API keys never logged or displayed after creation
-- Shell execution requires explicit user confirmation
-- Protected paths (`.env`, `*.key`, `*.pem`) cannot be modified by agents
-- Blocked commands (`rm -rf /`, `shutdown`, etc.) are rejected
-- Hook commands run with a 30-second timeout
+- **Shell execution requires explicit user confirmation** — this is the primary safety control
+- Agent file operations are **confined to the project directory** (`../`, absolute paths, and symlink escapes are rejected unless `--allow-outside` is passed)
+- Protected paths (`.env*`, `*.key`, `*.pem`, `*.p8`, `id_rsa`/`id_ed25519`, `credentials*`, `secrets*`, `.npmrc`, `.netrc`, the `.git` tree) cannot be modified, deleted, or moved by agents
+- Blocked commands (`rm -rf /`, `shutdown`, etc.) are a **best-effort speed bump, not a security boundary** — a creative command can bypass the substring blocklist, so the confirmation prompt is what actually protects you. Never run with auto-confirm on untrusted input.
+- Command and hook output is capped (1 MiB) so a runaway process can't exhaust memory
+- Before `repo analyze`/`review`/`audit` upload file contents for analysis, a best-effort **secret-redaction pass** replaces detected keys/tokens/private-key blocks with `[REDACTED]` (on top of `.gitignore`); the count of redactions is reported
+- Hook commands run with a 30-second timeout; interpolated variables (e.g. `{{file}}`) are shell-quoted to prevent injection
 - Session history stored locally, never sent to the server
 
 ### Troubleshooting
@@ -584,7 +603,7 @@ arcanflows whoami                   # Verify authentication
 ```
 
 Common issues:
-- **"Unauthorized"**: Run `arcanflows login` to refresh credentials
+- **"Unauthorized"**: the CLI auto-refreshes an expired access token using your stored refresh token; if it still fails (refresh token expired), run `arcanflows login`
 - **"Connection refused"**: Check server URL with `arcanflows health`
 - **"Agent not found"**: Run `arcanflows agents list` to see available agents
 - **Slow responses**: Check `arcanflows config view` for timeout settings

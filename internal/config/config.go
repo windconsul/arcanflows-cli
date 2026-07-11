@@ -23,6 +23,7 @@ type Settings struct {
 	ChatMarkdown       bool     `yaml:"chat_markdown"`
 	ChatSyntaxHL       bool     `yaml:"chat_syntax_highlight"`
 	ChatMaxHistory     int      `yaml:"chat_max_history"`
+	ChatMaxToolIters   int      `yaml:"chat_max_tool_iterations"` // agent-loop cap per user turn (PROPOSAL-010 Phase 1)
 	RepoMaxFileSize    int      `yaml:"repo_max_file_size"`
 	RepoMaxFiles       int      `yaml:"repo_max_files"`
 	RepoExclude        []string `yaml:"repo_exclude_patterns,omitempty"`
@@ -81,6 +82,7 @@ func DefaultConfig() *Config {
 			ChatMarkdown:    true,
 			ChatSyntaxHL:    true,
 			ChatMaxHistory:  50,
+			ChatMaxToolIters: 8,
 			RepoMaxFileSize: 100000,
 			RepoMaxFiles:    200,
 			RepoExclude: []string{
@@ -88,7 +90,7 @@ func DefaultConfig() *Config {
 				"*.min.js", "*.lock", ".next", "target", "build",
 			},
 			Color:            "auto",
-			Timeout:          "30s",
+			Timeout:          "120s", // non-streaming request timeout (streaming has none)
 			RetryCount:       3,
 			SessionHistory:   true,
 			SessionMaxAgeDays: 30,

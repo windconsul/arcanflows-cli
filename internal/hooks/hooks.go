@@ -1,6 +1,7 @@
 package hooks
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -233,18 +234,32 @@ func (m *Manager) getHooks(event HookEvent) []Hook {
 	}
 }
 
-// interpolate replaces {{variable}} placeholders in a command string.
+// shellQuote wraps a value in single quotes (escaping embedded single quotes)
+// so it becomes a single inert shell token. Hook commands are user-authored
+// shell strings that legitimately use pipes/redirects, so we can't drop `sh -c`
+// — but the interpolated variables are agent-controlled (a filename the model
+// chose), so they MUST be quoted or a name like `x; rm -rf .` injects
+// (PROPOSAL-010 C4).
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// interpolate replaces {{variable}} placeholders in a command string, quoting
+// each value so it can't break out of its shell token.
 func interpolate(command string, vars Variables) string {
 	r := strings.NewReplacer(
-		"{{file}}", vars.File,
-		"{{project_root}}", vars.ProjectRoot,
-		"{{branch}}", vars.Branch,
-		"{{agent}}", vars.Agent,
+		"{{file}}", shellQuote(vars.File),
+		"{{project_root}}", shellQuote(vars.ProjectRoot),
+		"{{branch}}", shellQuote(vars.Branch),
+		"{{agent}}", shellQuote(vars.Agent),
 	)
 	return r.Replace(command)
 }
 
-// execute runs a shell command and returns its output.
+// hookMaxOutputBytes caps hook output buffered in memory (C13).
+const hookMaxOutputBytes = 1 << 20 // 1 MiB
+
+// execute runs a shell command and returns its output (output-capped).
 func execute(command string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -252,14 +267,45 @@ func execute(command string) (string, error) {
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Env = os.Environ()
 
-	output, err := cmd.CombinedOutput()
+	var buf bytes.Buffer
+	w := &limitedWriter{buf: &buf, cap: hookMaxOutputBytes}
+	cmd.Stdout = w
+	cmd.Stderr = w
+
+	err := cmd.Run()
+	out := buf.String()
+	if w.truncated {
+		out += fmt.Sprintf("\n... [output truncated at %d bytes]", hookMaxOutputBytes)
+	}
 	if ctx.Err() == context.DeadlineExceeded {
-		return string(output), fmt.Errorf("hook timed out after 30s")
+		return out, fmt.Errorf("hook timed out after 30s")
 	}
 	if err != nil {
-		return string(output), err
+		return out, err
 	}
-	return strings.TrimSpace(string(output)), nil
+	return strings.TrimSpace(out), nil
+}
+
+// limitedWriter buffers up to cap and discards the rest, always accepting
+// writes so the child never blocks.
+type limitedWriter struct {
+	buf       *bytes.Buffer
+	cap       int
+	truncated bool
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if remaining := w.cap - w.buf.Len(); remaining > 0 {
+		if len(p) > remaining {
+			w.buf.Write(p[:remaining])
+			w.truncated = true
+		} else {
+			w.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		w.truncated = true
+	}
+	return len(p), nil
 }
 
 // GenerateTemplate returns a starter hooks.yaml template.

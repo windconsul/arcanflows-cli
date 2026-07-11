@@ -66,6 +66,7 @@ func BuildContext(scan *ScanResult, focus string) string {
 		"Cargo.toml", "Dockerfile", "docker-compose.yml",
 		"CLAUDE.md", "README.md",
 	}
+	redactedTotal := 0
 	for _, name := range contentFiles {
 		path := filepath.Join(scan.Root, name)
 		content, err := os.ReadFile(path)
@@ -77,7 +78,13 @@ func BuildContext(scan *ScanResult, focus string) string {
 		if len(text) > 3000 {
 			text = text[:3000] + "\n... (truncated)"
 		}
+		// Redact secrets before this content leaves the machine (C22).
+		text, n := Redact(text)
+		redactedTotal += n
 		sb.WriteString(fmt.Sprintf("### %s\n```\n%s\n```\n\n", name, text))
+	}
+	if redactedTotal > 0 {
+		fmt.Fprintf(os.Stderr, "  (redacted %d secret-like value(s) before upload)\n", redactedTotal)
 	}
 
 	// Git info
@@ -132,6 +139,11 @@ func BuildFileContext(filePath string, scan *ScanResult) string {
 	text := string(content)
 	if len(text) > 50000 {
 		text = text[:50000] + "\n... (truncated at 50,000 chars)"
+	}
+	// Redact secrets before this file leaves the machine (C22).
+	text, n := Redact(text)
+	if n > 0 {
+		fmt.Fprintf(os.Stderr, "  (redacted %d secret-like value(s) before upload)\n", n)
 	}
 	sb.WriteString(text)
 	sb.WriteString("\n```\n")

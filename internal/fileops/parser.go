@@ -4,12 +4,19 @@ import (
 	"strings"
 )
 
+// ReplaceEdit is one search/replace pair within a "replace" operation.
+type ReplaceEdit struct {
+	Search  string
+	Replace string
+}
+
 // FileOperation represents a file operation extracted from agent response.
 type FileOperation struct {
-	Type    string // "create", "edit", "delete", "rename"
-	Path    string
-	Content string
-	NewPath string // for rename
+	Type         string // "create", "edit", "replace", "delete", "rename"
+	Path         string
+	Content      string
+	NewPath      string        // for rename
+	Replacements []ReplaceEdit // for "replace" (anchored/diff edits)
 }
 
 // ParseOperations extracts file operation directives from agent text.
@@ -24,13 +31,21 @@ type FileOperation struct {
 //	--- End edit ---
 //
 //	--- Delete file: path ---
+// stripMD removes surrounding markdown emphasis/code ticks from a directive
+// line so a model that writes `**--- Create file: x ---**` or wraps directives
+// in backticks still triggers the operation (PROPOSAL-010 C6 — the same
+// bold-directive bug fixed platform-side).
+func stripMD(s string) string {
+	return strings.TrimSpace(strings.Trim(strings.TrimSpace(s), "*`"))
+}
+
 func ParseOperations(text string) []FileOperation {
 	var ops []FileOperation
 	lines := strings.Split(text, "\n")
 
 	i := 0
 	for i < len(lines) {
-		line := strings.TrimSpace(lines[i])
+		line := stripMD(lines[i])
 
 		// Create file
 		if isCreateDirective(line) {
@@ -44,6 +59,26 @@ func ParseOperations(text string) []FileOperation {
 					Type:    "create",
 					Path:    path,
 					Content: content,
+				})
+				i = endIdx + 1
+				continue
+			}
+		}
+
+		// Replace (anchored search/replace edit) — checked before Edit so
+		// "--- Replace: ..." isn't mistaken for anything else.
+		if isReplaceDirective(line) {
+			path := extractPath(line, "replace in:")
+			if path == "" {
+				path = extractPath(line, "replace:")
+			}
+			content, endIdx := extractBlock(lines, i+1, "--- end replace ---", "--- end ---")
+			edits := parseReplaceBlocks(strings.Split(content, "\n"))
+			if path != "" && len(edits) > 0 {
+				ops = append(ops, FileOperation{
+					Type:         "replace",
+					Path:         path,
+					Replacements: edits,
 				})
 				i = endIdx + 1
 				continue
@@ -107,9 +142,9 @@ func StripOperations(text string) string {
 	inBlock := false
 
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
+		trimmed := stripMD(line)
 
-		if isCreateDirective(trimmed) || isEditDirective(trimmed) {
+		if isCreateDirective(trimmed) || isEditDirective(trimmed) || isReplaceDirective(trimmed) {
 			inBlock = true
 			continue
 		}
@@ -139,6 +174,47 @@ func isEditDirective(line string) bool {
 	return strings.HasPrefix(lower, "--- edit:") || strings.HasPrefix(lower, "--- edit file:")
 }
 
+func isReplaceDirective(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.HasPrefix(lower, "--- replace:") || strings.HasPrefix(lower, "--- replace in:")
+}
+
+// parseReplaceBlocks parses conflict-marker search/replace blocks:
+//
+//	<<<<<<< SEARCH
+//	old text
+//	=======
+//	new text
+//	>>>>>>> REPLACE
+func parseReplaceBlocks(lines []string) []ReplaceEdit {
+	var edits []ReplaceEdit
+	var search, replace []string
+	state := 0 // 0=outside, 1=in search, 2=in replace
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(t, "<<<<<<<"):
+			state = 1
+			search, replace = nil, nil
+		case state != 0 && strings.HasPrefix(t, "======="):
+			state = 2
+		case state != 0 && strings.HasPrefix(t, ">>>>>>>"):
+			edits = append(edits, ReplaceEdit{
+				Search:  strings.Join(search, "\n"),
+				Replace: strings.Join(replace, "\n"),
+			})
+			state = 0
+		default:
+			if state == 1 {
+				search = append(search, line)
+			} else if state == 2 {
+				replace = append(replace, line)
+			}
+		}
+	}
+	return edits
+}
+
 func isDeleteDirective(line string) bool {
 	lower := strings.ToLower(line)
 	return strings.HasPrefix(lower, "--- delete file:") || strings.HasPrefix(lower, "--- delete:")
@@ -151,7 +227,8 @@ func isRenameDirective(line string) bool {
 
 func isEndDirective(line string) bool {
 	lower := strings.ToLower(line)
-	return lower == "--- end file ---" || lower == "--- end edit ---" || lower == "--- end ---"
+	return lower == "--- end file ---" || lower == "--- end edit ---" ||
+		lower == "--- end replace ---" || lower == "--- end ---"
 }
 
 func extractPath(line, prefix string) string {
@@ -172,8 +249,7 @@ func extractPath(line, prefix string) string {
 func extractBlock(lines []string, startIdx int, endMarkers ...string) (string, int) {
 	var content []string
 	for i := startIdx; i < len(lines); i++ {
-		trimmed := strings.TrimSpace(lines[i])
-		lower := strings.ToLower(trimmed)
+		lower := strings.ToLower(stripMD(lines[i]))
 		for _, marker := range endMarkers {
 			if lower == marker {
 				return strings.Join(content, "\n"), i

@@ -2,10 +2,13 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/arcanflows/cli/internal/api"
@@ -53,6 +56,7 @@ func init() {
 	chatCmd.Flags().String("model", "", "override model for this session")
 	chatCmd.Flags().String("conversation-id", "", "continue existing conversation")
 	chatCmd.Flags().Bool("continue", false, "continue last conversation")
+	chatCmd.Flags().Bool("allow-outside", false, "allow file operations outside the project directory (unsafe)")
 
 	// Ask flags
 	askCmd.Flags().String("agent", "", "agent slug or name")
@@ -135,11 +139,9 @@ func resolveAgentID(client *api.Client, agentFlag, agentIDFlag string) (string, 
 	}
 	fmt.Fprintf(os.Stderr, "\n")
 
-	reader := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Fprintf(os.Stderr, "%sChoice [1-%d]:%s ", render.Bold, len(activeAgents), render.Reset)
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
+		input, _ := render.ReadLine()
 
 		var choice int
 		if _, err := fmt.Sscanf(input, "%d", &choice); err == nil && choice >= 1 && choice <= len(activeAgents) {
@@ -173,10 +175,21 @@ var sessionStore *session.Store
 func runChat(cmd *cobra.Command, args []string) error {
 	client := requireAuth()
 
+	// Single shared stdin reader for the whole session — chat input, the agent
+	// picker, and every y/n confirmation read from THIS reader (PROPOSAL-010 C11).
+	reader := bufio.NewReader(os.Stdin)
+	render.SetInputReader(reader)
+
 	agentFlag, _ := cmd.Flags().GetString("agent")
 	agentIDFlag, _ := cmd.Flags().GetString("agent-id")
 	conversationID, _ := cmd.Flags().GetString("conversation-id")
 	continueFlag, _ := cmd.Flags().GetBool("continue")
+
+	// Confine file operations to the project directory unless explicitly allowed.
+	if allowOutside, _ := cmd.Flags().GetBool("allow-outside"); allowOutside {
+		fileops.SetAllowOutside(true)
+		render.Warning("File operations are NOT confined to the project directory (--allow-outside)")
+	}
 
 	// Support positional arg as agent name: arcanflows chat "My Agent"
 	if agentFlag == "" && agentIDFlag == "" && len(args) > 0 {
@@ -260,11 +273,39 @@ func runChat(cmd *cobra.Command, args []string) error {
 
 	render.Header(
 		fmt.Sprintf("ArcanFlows Chat - %s", agentName),
-		fmt.Sprintf("Type /help for commands, Ctrl+C to exit | %s", profile.Organization),
+		fmt.Sprintf("Type /help for commands, Ctrl+C to cancel/exit | %s", profile.Organization),
 	)
 	fmt.Fprintln(os.Stderr)
 
-	reader := bufio.NewReader(os.Stdin)
+	// Content queued by /file, prepended to the next message (C5).
+	var pendingFileContext strings.Builder
+
+	// One persistent Ctrl+C handler for the whole session: during a turn it
+	// cancels that turn (1.3); at the idle prompt it saves the session and
+	// exits (C19) instead of the process being killed with nothing saved.
+	var turnMu sync.Mutex
+	var turnCancel context.CancelFunc
+	var turnInterrupted bool
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	go func() {
+		for range sigCh {
+			turnMu.Lock()
+			cancel := turnCancel
+			if cancel != nil {
+				turnInterrupted = true
+				turnMu.Unlock()
+				cancel()
+				continue
+			}
+			turnMu.Unlock()
+			// Idle: save and exit cleanly.
+			fmt.Fprintln(os.Stderr)
+			saveSessionOnExit()
+			os.Exit(0)
+		}
+	}()
 
 	for {
 		render.Prompt("You")
@@ -282,6 +323,29 @@ func runChat(cmd *cobra.Command, args []string) error {
 
 		// Handle in-session commands
 		if strings.HasPrefix(input, "/") {
+			// State-mutating commands need runChat scope (conversationID, pending).
+			switch {
+			case input == "/clear":
+				// Actually start a fresh conversation (C9) — was a no-op before.
+				conversationID = ""
+				if sessionEnabled {
+					activeSession = session.NewSession(agentID, agentName)
+				}
+				pendingFileContext.Reset()
+				render.Info("Conversation cleared — starting fresh")
+				continue
+			case strings.HasPrefix(input, "/file "):
+				// Actually attach the file to the next message (C5) — was discarded.
+				p := strings.TrimSpace(strings.TrimPrefix(input, "/file "))
+				content, ferr := fileops.ReadFile(p)
+				if ferr != nil {
+					render.Error(ferr.Error())
+				} else {
+					pendingFileContext.WriteString(fmt.Sprintf("## Attached file: %s\n```\n%s\n```\n\n", p, content))
+					render.Info(fmt.Sprintf("Attached %s — it will be included with your next message", p))
+				}
+				continue
+			}
 			if handleChatCommand(input) {
 				continue
 			}
@@ -296,149 +360,273 @@ func runChat(cmd *cobra.Command, args []string) error {
 			activeSession.AddMessage("user", input)
 		}
 
-		// Send message and stream response
-		render.AgentLabel(agentName)
-
-		start := time.Now()
-		var promptTokens, completionTokens int
-		filter := render.NewToolFilter()
-
-		err = client.ChatStream(agentID, api.ChatRequest{
-			Message:        func() string {
-						if projectInstructions != "" && conversationID == "" {
-							msg := projectInstructions + input
-							projectInstructions = "" // only send once
-							return msg
-						}
-						return input
-					}(),
-			ConversationID: conversationID,
-		}, func(chunk api.StreamChunk) {
-			// Handle metadata event
-			if chunk.Type == "metadata" && chunk.ConversationID != "" {
-				conversationID = chunk.ConversationID
-				// Update session with server conversation ID
-				if activeSession != nil {
-					activeSession.ConversationID = conversationID
-				}
-				return
-			}
-
-			// Handle thinking
-			if chunk.Thinking != "" {
-				return
-			}
-
-			// Handle tool status from backend
-			if chunk.ToolStatus != "" {
-				fmt.Fprintf(os.Stderr, "\n%s  [Using tool: %s...]%s\n", render.Dim, chunk.ToolStatus, render.Reset)
-				return
-			}
-
-			// Handle streaming content — filter USE_TOOL: directives
-			if chunk.Delta != "" {
-				if text := filter.ProcessDelta(chunk.Delta); text != "" {
-					fmt.Print(text)
-				}
-			} else if chunk.Content != "" && chunk.Done {
-				content := filter.ProcessFinalContent(chunk.Content)
-				if filter.Output.Len() == 0 && content != "" {
-					fmt.Print(content)
-				}
-			}
-
-			// Capture token counts
-			if chunk.TotalTokens > 0 {
-				promptTokens = chunk.PromptTokens
-				completionTokens = chunk.CompletionTokens
-			}
-		})
-
-		elapsed := time.Since(start)
-		fmt.Println() // newline after streamed response
-
-		if err != nil {
-			render.Error(fmt.Sprintf("Chat error: %v", err))
-			continue
+		// --- Agentic loop (PROPOSAL-010 Phase 1) --------------------------------
+		// Send the message, apply any local file/shell actions the agent asks for,
+		// feed the outcomes back into the SAME conversation, and let the agent
+		// continue — up to a bounded number of iterations. The backend rehydrates
+		// history from conversation_id, so only the new message is sent each turn.
+		maxIters := cfg.Settings.ChatMaxToolIters
+		if maxIters <= 0 {
+			maxIters = 8
+		}
+		originalRequest := input
+		nextMessage := input
+		// Attach any /file content queued for this message (C5).
+		if pendingFileContext.Len() > 0 {
+			nextMessage = pendingFileContext.String() + "\n" + nextMessage
+			pendingFileContext.Reset()
+		}
+		// Send project instructions + memory on the FIRST message of the session,
+		// including on --continue (C10): the server has prior chat history but not
+		// this client-side context.
+		if projectInstructions != "" {
+			nextMessage = projectInstructions + nextMessage
+			projectInstructions = "" // only send once
 		}
 
-		// Flush any remaining buffered content
-		if flushed := filter.Flush(); flushed != "" {
-			fmt.Print(flushed)
-		}
+		for iter := 0; iter < maxIters; iter++ {
+			// Turn cancellation is handled by the persistent Ctrl+C handler above;
+			// register this turn's cancel func so an interrupt aborts the request
+			// (1.3) rather than killing the CLI.
+			turnCtx, cancelTurn := context.WithCancel(context.Background())
+			turnMu.Lock()
+			turnCancel = cancelTurn
+			turnInterrupted = false
+			turnMu.Unlock()
 
-		// Track assistant response in session
-		fullResponse := filter.Output.String()
-		if activeSession != nil && fullResponse != "" {
-			activeSession.AddMessage("assistant", fullResponse)
-		}
+			render.AgentLabel(agentName)
+			start := time.Now()
+			var promptTokens, completionTokens int
+			filter := render.NewToolFilter()
 
-		// Process file operations from agent response
-		ops := fileops.ParseOperations(fullResponse)
-		if len(ops) > 0 {
-			fmt.Fprintf(os.Stderr, "\n%s  %d file operation(s) detected%s\n", render.Dim, len(ops), render.Reset)
-			for _, op := range ops {
-				hookVars.File = op.Path
-				switch op.Type {
-				case "create":
-					fileops.CreateFile(op.Path, op.Content, false)
-					hooksMgr.Run(hooks.PostCreate, hookVars)
+			err = client.ChatStreamContext(turnCtx, agentID, api.ChatRequest{
+				Message:        nextMessage,
+				ConversationID: conversationID,
+			}, func(chunk api.StreamChunk) {
+				if chunk.Type == "metadata" && chunk.ConversationID != "" {
+					conversationID = chunk.ConversationID
 					if activeSession != nil {
-						activeSession.AddFileModified(op.Path)
+						activeSession.ConversationID = conversationID
 					}
-				case "edit":
-					fileops.EditFile(op.Path, op.Content, false)
-					hooksMgr.Run(hooks.PostEdit, hookVars)
-					if activeSession != nil {
-						activeSession.AddFileModified(op.Path)
+					return
+				}
+				if chunk.Thinking != "" {
+					return
+				}
+				if chunk.ToolStatus != "" {
+					fmt.Fprintf(os.Stderr, "\n%s  [Using tool: %s...]%s\n", render.Dim, chunk.ToolStatus, render.Reset)
+					return
+				}
+				if chunk.Delta != "" {
+					if text := filter.ProcessDelta(chunk.Delta); text != "" {
+						fmt.Print(text)
 					}
-				case "delete":
-					fileops.DeleteFile(op.Path, false)
-					hooksMgr.Run(hooks.PostDelete, hookVars)
-					if activeSession != nil {
-						activeSession.AddFileModified(op.Path)
-					}
-				case "rename":
-					if err := os.Rename(op.Path, op.NewPath); err == nil {
-						render.Success(fmt.Sprintf("Renamed %s -> %s", op.Path, op.NewPath))
-						if activeSession != nil {
-							activeSession.AddFileModified(op.NewPath)
-						}
+				} else if chunk.Content != "" && chunk.Done {
+					content := filter.ProcessFinalContent(chunk.Content)
+					if filter.Output.Len() == 0 && content != "" {
+						fmt.Print(content)
 					}
 				}
-			}
-		}
-
-		// Process shell execution directives from agent response
-		shellCmds := shell.ParseExecuteDirectives(fullResponse)
-		if len(shellCmds) > 0 {
-			shellCfg := shell.DefaultConfig()
-			for _, shCmd := range shellCmds {
-				shell.Execute(shCmd, shellCfg)
-				if activeSession != nil {
-					activeSession.AddCommandRun(shCmd)
+				if chunk.TotalTokens > 0 {
+					promptTokens = chunk.PromptTokens
+					completionTokens = chunk.CompletionTokens
 				}
+			})
+
+			turnMu.Lock()
+			turnCancel = nil
+			interrupted := turnInterrupted
+			turnMu.Unlock()
+			cancelTurn()
+			elapsed := time.Since(start)
+			fmt.Println() // newline after streamed response
+
+			if interrupted {
+				render.Warning("Interrupted — returning to prompt")
+				break
 			}
+			if err != nil {
+				render.Error(fmt.Sprintf("Chat error: %v", err))
+				break
+			}
+
+			if flushed := filter.Flush(); flushed != "" {
+				fmt.Print(flushed)
+			}
+			fullResponse := filter.Output.String()
+			if activeSession != nil && fullResponse != "" {
+				activeSession.AddMessage("assistant", fullResponse)
+			}
+
+			if promptTokens > 0 || completionTokens > 0 {
+				fmt.Fprintf(os.Stderr, "%s  [%d in / %d out | %.1fs]%s\n",
+					render.Dim, promptTokens, completionTokens, elapsed.Seconds(), render.Reset)
+			}
+
+			// Apply the agent's local actions and collect their outcomes.
+			summary, meaningful := applyAgentActions(fullResponse, hooksMgr, &hookVars)
+
+			if activeSession != nil && sessionStore != nil {
+				_ = sessionStore.Save(activeSession)
+			}
+
+			if meaningful == 0 {
+				// No local actions to report — the agent's turn is complete.
+				break
+			}
+			if iter == maxIters-1 {
+				render.Warning(fmt.Sprintf("Reached the %d-step tool limit; stopping (raise chat_max_tool_iterations to allow more)", maxIters))
+				break
+			}
+
+			// Feed the outcomes back and let the agent continue.
+			fmt.Fprintf(os.Stderr, "%s  [sending results back to the agent…]%s\n", render.Dim, render.Reset)
+			nextMessage = buildToolResultMessage(originalRequest, summary)
 		}
 
-		// Auto-save session after each exchange
-		if activeSession != nil && sessionStore != nil {
-			if err := sessionStore.Save(activeSession); err != nil {
-				// Silent save failure — don't interrupt chat
-			}
-		}
-
-		// Print stats
-		if promptTokens > 0 || completionTokens > 0 {
-			fmt.Fprintf(os.Stderr, "%s  [%d in / %d out | %.1fs]%s\n",
-				render.Dim, promptTokens, completionTokens, elapsed.Seconds(), render.Reset)
-		}
 		fmt.Fprintln(os.Stderr)
 	}
 }
 
-// saveSessionOnExit saves the session and prints a message on exit.
+// applyAgentActions executes the file/shell directives found in an agent
+// response and returns a human-readable summary plus the count of "meaningful"
+// outcomes — applied or failed. User-skipped actions don't count, so a decline
+// doesn't keep the agent loop nagging (PROPOSAL-010 Phase 1).
+func applyAgentActions(response string, hooksMgr *hooks.Manager, hookVars *hooks.Variables) (string, int) {
+	var lines []string
+	meaningful := 0
+
+	ops := fileops.ParseOperations(response)
+	if len(ops) > 0 {
+		fmt.Fprintf(os.Stderr, "\n%s  %d file operation(s) detected%s\n", render.Dim, len(ops), render.Reset)
+		for _, op := range ops {
+			hookVars.File = op.Path
+			target := op.Path
+			if op.Type == "rename" {
+				target = fmt.Sprintf("%s -> %s", op.Path, op.NewPath)
+			}
+
+			// pre_* hooks now fire (C8): a hard failure blocks the operation.
+			preEvent := map[string]hooks.HookEvent{"create": hooks.PreCreate, "edit": hooks.PreEdit, "replace": hooks.PreEdit, "delete": hooks.PreDelete}[op.Type]
+			if preEvent != "" {
+				if _, herr := hooksMgr.Run(preEvent, *hookVars); herr != nil {
+					render.Warning(fmt.Sprintf("%s blocked by %s hook: %v", op.Type, preEvent, herr))
+					lines = append(lines, fmt.Sprintf("- %s %s: blocked by %s hook", op.Type, target, preEvent))
+					meaningful++
+					continue
+				}
+			}
+
+			var opErr error
+			switch op.Type {
+			case "create":
+				opErr = fileops.CreateFile(op.Path, op.Content, false)
+				if opErr == nil {
+					hooksMgr.Run(hooks.PostCreate, *hookVars)
+					sessionAddFile(op.Path)
+				}
+			case "edit":
+				opErr = fileops.EditFile(op.Path, op.Content, false)
+				if opErr == nil {
+					hooksMgr.Run(hooks.PostEdit, *hookVars)
+					sessionAddFile(op.Path)
+				}
+			case "replace":
+				opErr = fileops.ReplaceInFile(op.Path, op.Replacements, false)
+				if opErr == nil {
+					hooksMgr.Run(hooks.PostEdit, *hookVars)
+					sessionAddFile(op.Path)
+				}
+			case "delete":
+				opErr = fileops.DeleteFile(op.Path, false)
+				if opErr == nil {
+					hooksMgr.Run(hooks.PostDelete, *hookVars)
+					sessionAddFile(op.Path)
+				}
+			case "rename":
+				opErr = fileops.MoveFile(op.Path, op.NewPath, false)
+				if opErr == nil {
+					sessionAddFile(op.NewPath)
+				}
+			}
+			if opErr != nil {
+				render.Error(opErr.Error())
+				lines = append(lines, fmt.Sprintf("- %s %s: FAILED — %v", op.Type, target, opErr))
+			} else {
+				lines = append(lines, fmt.Sprintf("- %s %s: ok", op.Type, target))
+			}
+			meaningful++
+		}
+	}
+
+	shellCmds := shell.ParseExecuteDirectives(response)
+	if len(shellCmds) > 0 {
+		shellCfg := shell.DefaultConfig()
+		for _, shCmd := range shellCmds {
+			// pre_run/post_run hooks now fire (C8).
+			hooksMgr.Run(hooks.PreRun, *hookVars)
+			out, code, execErr := shell.Execute(shCmd, shellCfg)
+			hooksMgr.Run(hooks.PostRun, *hookVars)
+			if activeSession != nil {
+				activeSession.AddCommandRun(shCmd)
+			}
+			switch {
+			case code == -1 && execErr == nil:
+				// user declined at the confirmation prompt — not meaningful
+				lines = append(lines, fmt.Sprintf("- $ %s: skipped by user", shCmd))
+			case code == -1 && execErr != nil:
+				lines = append(lines, fmt.Sprintf("- $ %s: not run (%v)", shCmd, execErr))
+				meaningful++
+			default:
+				snippet := out
+				if len(snippet) > 2000 {
+					snippet = snippet[:2000] + "\n... (truncated)"
+				}
+				lines = append(lines, fmt.Sprintf("- $ %s: exit %d\n```\n%s\n```", shCmd, code, snippet))
+				meaningful++
+			}
+		}
+	}
+
+	return strings.Join(lines, "\n"), meaningful
+}
+
+// sessionAddFile records a modified file in the active session, if any.
+func sessionAddFile(path string) {
+	if activeSession != nil {
+		activeSession.AddFileModified(path)
+	}
+}
+
+// buildToolResultMessage formats the outcome of local actions as a follow-up
+// message for the agent, and restates the original goal so it survives the
+// server's ~10-message rehydration window during a longer loop.
+func buildToolResultMessage(originalRequest, summary string) string {
+	var b strings.Builder
+	b.WriteString("[SYSTEM — automated results of the actions you just requested]\n")
+	b.WriteString(summary)
+	b.WriteString("\n\nIf more steps are needed, provide the next actions (file blocks / EXECUTE:). " +
+		"If the task is complete, give a short final summary and stop — do not repeat actions that already succeeded.")
+	if r := strings.TrimSpace(originalRequest); r != "" {
+		if len(r) > 300 {
+			r = r[:300] + "…"
+		}
+		b.WriteString("\n\n(Original request, for reference: " + r + ")")
+	}
+	return b.String()
+}
+
+// saveSessionOnExit saves the session, fires post_chat hooks (C8), and prints a
+// message on exit.
 func saveSessionOnExit() {
+	if mgr := hooks.Load(); mgr.HasHooks(hooks.PostChat) {
+		cwd, _ := os.Getwd()
+		vars := hooks.Variables{ProjectRoot: cwd, Branch: runGitCmd("rev-parse", "--abbrev-ref", "HEAD")}
+		if activeSession != nil {
+			vars.Agent = activeSession.AgentName
+		}
+		mgr.Run(hooks.PostChat, vars)
+	}
 	if activeSession != nil && sessionStore != nil && activeSession.MessageCount > 0 {
 		if err := sessionStore.Save(activeSession); err == nil {
 			render.Info(fmt.Sprintf("Session saved (%d messages). Resume with: arcanflows chat --continue",
@@ -492,21 +680,9 @@ func runAsk(cmd *cobra.Command, args []string) error {
 }
 
 // handleChatCommand processes in-session / commands. Returns true if handled.
+// Note: /file and /clear are handled in runChat (they mutate session state).
 func handleChatCommand(input string) bool {
 	// Commands with arguments
-	if strings.HasPrefix(input, "/file ") {
-		path := strings.TrimPrefix(input, "/file ")
-		path = strings.TrimSpace(path)
-		content, err := fileops.ReadFile(path)
-		if err != nil {
-			render.Error(err.Error())
-		} else {
-			fmt.Fprintf(os.Stderr, "%s  (file attached — mention it in your next message)%s\n", render.Dim, render.Reset)
-			_ = content // will be sent with next message via context
-		}
-		return true
-	}
-
 	if strings.HasPrefix(input, "/run ") {
 		command := strings.TrimPrefix(input, "/run ")
 		command = strings.TrimSpace(command)
@@ -542,9 +718,6 @@ func handleChatCommand(input string) bool {
 		fmt.Fprintln(os.Stderr, "    /clear            Clear conversation")
 		fmt.Fprintln(os.Stderr, "    /exit             Exit chat")
 		fmt.Fprintln(os.Stderr, "")
-		return true
-	case "/clear":
-		render.Info("Conversation cleared")
 		return true
 	case "/sessions":
 		if activeSession != nil {

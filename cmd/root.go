@@ -88,9 +88,23 @@ func loadProjectInstructions() string {
 	return "## Project Instructions (from ARCANFLOWS.md)\n\n" + content + "\n\n---\n\n"
 }
 
-// newAPIClient creates an API client from current config/creds.
+// newAPIClient creates an API client from current config/creds, wiring token
+// refresh so a 401 transparently refreshes and persists the new tokens (C15).
 func newAPIClient() *api.Client {
-	return api.NewClient(cfg, creds)
+	client := api.NewClient(cfg, creds)
+	client.OnRefresh = func(accessToken, refreshToken string) {
+		if creds.Profiles == nil {
+			creds.Profiles = make(map[string]config.ProfileCredentials)
+		}
+		pc := creds.Profiles[cfg.ActiveProfile]
+		pc.AccessToken = accessToken
+		if refreshToken != "" {
+			pc.RefreshToken = refreshToken
+		}
+		creds.Profiles[cfg.ActiveProfile] = pc
+		_ = creds.Save()
+	}
+	return client
 }
 
 // requireAuth checks that credentials exist and returns a client.

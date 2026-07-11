@@ -1,12 +1,49 @@
 package render
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"strings"
 	"text/tabwriter"
 	"time"
 )
+
+// inputReader is the single, shared reader for all interactive stdin input.
+// Everything that reads a line from the user — the chat prompt, y/n
+// confirmations, pickers — MUST go through this reader. Mixing a bufio.Reader
+// (chat loop) with fmt.Scanln (confirmations) on the same fd corrupts buffered
+// input; a single shared reader avoids that (PROPOSAL-010 C11).
+var inputReader *bufio.Reader
+
+// SetInputReader installs the shared stdin reader (called once by the chat loop).
+func SetInputReader(r *bufio.Reader) { inputReader = r }
+
+// ReadLine reads one trimmed line from the shared stdin reader, lazily
+// initializing it from os.Stdin if the caller never set one. The bool is false
+// on EOF/error.
+func ReadLine() (string, bool) {
+	if inputReader == nil {
+		inputReader = bufio.NewReader(os.Stdin)
+	}
+	line, err := inputReader.ReadString('\n')
+	if err != nil && line == "" {
+		return "", false
+	}
+	return strings.TrimSpace(line), true
+}
+
+// Confirm prints a y/n prompt and reads the answer from the shared reader.
+// Anything other than y/yes (including empty/EOF) is a safe "no".
+func Confirm(prompt string) bool {
+	fmt.Fprintf(os.Stderr, "%s%s [y/n]:%s ", Bold, prompt, Reset)
+	resp, ok := ReadLine()
+	if !ok {
+		return false
+	}
+	resp = strings.ToLower(resp)
+	return resp == "y" || resp == "yes"
+}
 
 // Colors for terminal output.
 const (

@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -11,7 +12,38 @@ import (
 	"github.com/arcanflows/cli/internal/render"
 )
 
-// Default blocked commands that should never execute.
+// maxOutputBytes caps how much command output is buffered in memory, so a
+// runaway command (e.g. `yes`, `cat huge.log`) can't OOM the CLI
+// (PROPOSAL-010 C13).
+const maxOutputBytes = 1 << 20 // 1 MiB
+
+// capWriter buffers up to a cap and discards the rest, but always accepts
+// writes so the child process never blocks on a full pipe.
+type capWriter struct {
+	buf       bytes.Buffer
+	cap       int
+	truncated bool
+}
+
+func (w *capWriter) Write(p []byte) (int, error) {
+	if remaining := w.cap - w.buf.Len(); remaining > 0 {
+		if len(p) > remaining {
+			w.buf.Write(p[:remaining])
+			w.truncated = true
+		} else {
+			w.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		w.truncated = true
+	}
+	return len(p), nil
+}
+
+// NOTE: BlockedCommands is a best-effort *speed bump*, not a security boundary.
+// It's a substring match on a few literal disasters; it does NOT stop a
+// determined or creative command (e.g. `rm -rf ~`, `find / -delete`,
+// `curl … | sh`). The real safety control is the confirmation prompt below —
+// never run this with AutoConfirm on untrusted input (PROPOSAL-010 C12).
 var BlockedCommands = []string{
 	"rm -rf /",
 	"rm -rf /*",
@@ -65,14 +97,10 @@ func Execute(command string, cfg Config) (string, int, error) {
 		return "", -1, fmt.Errorf("command blocked for safety: %s", command)
 	}
 
-	// Confirm
+	// Confirm (via the shared stdin reader — PROPOSAL-010 C11).
 	if !cfg.AutoConfirm {
 		fmt.Fprintf(os.Stderr, "\n%s  EXECUTE: %s%s\n", render.Yellow, command, render.Reset)
-		fmt.Fprintf(os.Stderr, "%sExecute this command? [y/n]:%s ", render.Bold, render.Reset)
-		var response string
-		fmt.Scanln(&response)
-		response = strings.ToLower(strings.TrimSpace(response))
-		if response != "y" && response != "yes" {
+		if !render.Confirm("Execute this command?") {
 			render.Info("Skipped")
 			return "", -1, nil
 		}
@@ -86,9 +114,15 @@ func Execute(command string, cfg Config) (string, int, error) {
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Env = os.Environ()
 
+	// Cap output so a runaway command can't OOM the CLI (C13).
+	w := &capWriter{cap: maxOutputBytes}
+	cmd.Stdout = w
+	cmd.Stderr = w
+
 	fmt.Fprintf(os.Stderr, "%s[Running...]%s\n", render.Dim, render.Reset)
 
-	output, err := cmd.CombinedOutput()
+	err := cmd.Run()
+	output := w.buf.Bytes()
 	exitCode := 0
 
 	if err != nil {
@@ -103,6 +137,9 @@ func Execute(command string, cfg Config) (string, int, error) {
 	}
 
 	outStr := strings.TrimSpace(string(output))
+	if w.truncated {
+		outStr += fmt.Sprintf("\n%s... [output truncated at %d bytes]%s", render.Dim, maxOutputBytes, render.Reset)
+	}
 
 	// Print output
 	if outStr != "" {
@@ -119,23 +156,24 @@ func Execute(command string, cfg Config) (string, int, error) {
 }
 
 // ParseExecuteDirectives extracts EXECUTE: directives from agent response text.
+// Leading/trailing markdown emphasis and code ticks are stripped so a model
+// that writes `**EXECUTE: npm test**` or `` `EXECUTE: ...` `` still runs
+// (PROPOSAL-010 C6).
 func ParseExecuteDirectives(text string) []string {
 	var commands []string
-	lines := strings.Split(text, "\n")
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "EXECUTE:") {
-			cmd := strings.TrimPrefix(trimmed, "EXECUTE:")
-			cmd = strings.TrimSpace(cmd)
-			if cmd != "" {
-				commands = append(commands, cmd)
-			}
-		}
-		if strings.HasPrefix(trimmed, "EXECUTE_SILENT:") {
-			cmd := strings.TrimPrefix(trimmed, "EXECUTE_SILENT:")
-			cmd = strings.TrimSpace(cmd)
-			if cmd != "" {
-				commands = append(commands, cmd)
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.Trim(strings.TrimSpace(line), "*`")
+		trimmed = strings.TrimSpace(trimmed)
+		for _, prefix := range []string{"EXECUTE:", "EXECUTE_SILENT:"} {
+			if strings.HasPrefix(trimmed, prefix) {
+				cmd := strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))
+				// A trailing `**`/backtick may survive if the command itself had
+				// no spaces before it; trim those too.
+				cmd = strings.TrimSpace(strings.Trim(cmd, "*`"))
+				if cmd != "" {
+					commands = append(commands, cmd)
+				}
+				break
 			}
 		}
 	}

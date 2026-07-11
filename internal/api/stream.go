@@ -2,8 +2,10 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -41,7 +43,14 @@ type ChatStreamCallback func(chunk StreamChunk)
 
 // ChatStream sends a message and streams the response via SSE.
 func (c *Client) ChatStream(agentID string, req ChatRequest, callback ChatStreamCallback) error {
-	resp, err := c.StreamPost(fmt.Sprintf("/api/v1/agents/%s/chat/stream", agentID), req)
+	return c.ChatStreamContext(context.Background(), agentID, req, callback)
+}
+
+// ChatStreamContext is ChatStream bound to a cancellable context. When ctx is
+// cancelled (e.g. Ctrl+C on the current turn), the underlying HTTP request is
+// aborted and this returns ctx.Err() (PROPOSAL-010 1.3).
+func (c *Client) ChatStreamContext(ctx context.Context, agentID string, req ChatRequest, callback ChatStreamCallback) error {
+	resp, err := c.StreamPostContext(ctx, fmt.Sprintf("/api/v1/agents/%s/chat/stream", agentID), req)
 	if err != nil {
 		return err
 	}
@@ -56,40 +65,40 @@ func (c *Client) ChatStream(agentID string, req ChatRequest, callback ChatStream
 		return fmt.Errorf("chat error: HTTP %d", resp.StatusCode)
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
-	// Increase buffer for large responses
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// SSE format: "data: {json}"
-		if !strings.HasPrefix(line, "data: ") {
-			continue
+	// Use a bufio.Reader (not Scanner) so an SSE line larger than 1 MiB — a big
+	// tool result streamed as one data frame — doesn't error the stream with
+	// "token too long" (PROPOSAL-010 C20). ReadString grows its buffer as needed.
+	reader := bufio.NewReader(resp.Body)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
 		}
 
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			callback(StreamChunk{Done: true})
-			return nil
+		line, readErr := reader.ReadString('\n')
+		if line != "" {
+			line = strings.TrimRight(line, "\r\n")
+			if strings.HasPrefix(line, "data: ") {
+				data := strings.TrimPrefix(line, "data: ")
+				if data == "[DONE]" {
+					callback(StreamChunk{Done: true})
+					return nil
+				}
+				var chunk StreamChunk
+				if err := json.Unmarshal([]byte(data), &chunk); err == nil {
+					callback(chunk)
+					if chunk.Done {
+						return nil
+					}
+				}
+			}
 		}
-
-		var chunk StreamChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			// Skip unparseable chunks
-			continue
-		}
-
-		callback(chunk)
-
-		if chunk.Done {
-			return nil
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("stream read error: %w", readErr)
 		}
 	}
-
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("stream read error: %w", err)
-	}
-
-	return nil
 }
