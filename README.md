@@ -141,6 +141,30 @@ arcanflows chat --model gpt-4o            # Override model
 | `/clear` | Clear conversation |
 | `/exit` | Exit chat |
 
+### Builder
+
+Design and create no-code components — data tables, forms, agents, workflows, tools, analytics dashboards, and whole apps — by conversation. The Builder proposes a plan; you review it and type `/build` to create everything, cross-wired.
+
+```bash
+arcanflows builder                                              # Interactive
+arcanflows builder "a contacts table and an intake form that saves to it"
+arcanflows builder "a daily sales report dashboard" --yes       # plan + build, non-interactive
+```
+
+Refine by just talking — *"add a status field"*, *"make the form shorter"*, *"also notify the agent"*. Nothing is created until you run `/build`.
+
+#### In-Session Commands
+
+| Command | Action |
+|---------|--------|
+| `/build` | Create the current plan (cross-wired) |
+| `/plan` | Show the current (un-built) plan |
+| `/new` | Start a fresh Builder project |
+| `/help` | Show all commands |
+| `/exit` | Exit the Builder |
+
+After a build, each created component shows a status: green ✓ when ready, yellow `!` with the specific fix when it needs attention (e.g. an empty dashboard or an unmapped form).
+
 #### Dev Mode Features
 
 The chat agent can create, edit, and delete files in your project:
