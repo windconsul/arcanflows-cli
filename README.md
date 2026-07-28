@@ -489,7 +489,20 @@ settings:
 
 ---
 
+## Doctor
+
+Diagnose your CLI setup in one command — config, credentials, token expiry, server reachability, whether the server actually accepts your credentials, and CLI version currency.
+
+```bash
+arcanflows doctor          # report the status of every check (read-only)
+arcanflows doctor --fix    # report, then apply safe fixes (refresh token, self-update)
+```
+
+Read-only by default: it prints a ✓/!/✗ checklist and, for each issue, the exact command to fix it. With `--fix` it applies the safe fixes automatically (refresh an expired token via your refresh token, and install the latest CLI version).
+
 ## Auto-Update
+
+Updates pull from the public CLI repo's GitHub releases (`windconsul/arcanflows-cli`; override with `ARCANFLOWS_CLI_REPO`).
 
 ```bash
 arcanflows update check             # Check for new version

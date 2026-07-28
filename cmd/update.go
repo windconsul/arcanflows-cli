@@ -14,7 +14,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const releaseAPI = "https://api.github.com/repos/windconsul/ai-saas-agents/releases/latest"
+// cliRepo is the public GitHub repo that publishes CLI releases + binaries. It
+// matches install.sh (ARCANFLOWS_CLI_REPO, default windconsul/arcanflows-cli) —
+// NOT the monorepo, which is private and has no CLI binaries.
+func cliRepo() string {
+	if r := os.Getenv("ARCANFLOWS_CLI_REPO"); r != "" {
+		return r
+	}
+	return "windconsul/arcanflows-cli"
+}
+
+func releaseAPIURL() string {
+	return "https://api.github.com/repos/" + cliRepo() + "/releases/latest"
+}
 
 var updateCmd = &cobra.Command{
 	Use:   "update",
@@ -52,14 +64,14 @@ type githubRelease struct {
 
 func fetchLatestRelease() (*githubRelease, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(releaseAPI)
+	resp, err := client.Get(releaseAPIURL())
 	if err != nil {
 		return nil, fmt.Errorf("failed to check for updates: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("GitHub API returned %d (rate limited or no releases)", resp.StatusCode)
+		return nil, fmt.Errorf("GitHub API returned %d for %s (rate limited or no releases)", resp.StatusCode, cliRepo())
 	}
 
 	var release githubRelease
