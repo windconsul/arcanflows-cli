@@ -351,3 +351,26 @@ func (c *Client) CreateAgent(req map[string]interface{}) (*Agent, error) {
 	}
 	return &agent, nil
 }
+
+// DownloadRaw fetches an absolute URL with the client's auth token and
+// returns the body bytes — the artifact bridge (PROPOSAL-010 §6.6). Only
+// call with URLs pointing at the configured platform host.
+func (c *Client) DownloadRaw(url string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	const maxArtifact = 100 << 20 // 100MB cap — no OOM from a runaway file
+	return io.ReadAll(io.LimitReader(resp.Body, maxArtifact))
+}

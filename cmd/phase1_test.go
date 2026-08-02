@@ -32,7 +32,7 @@ func TestApplyAgentActionsCapturesResults(t *testing.T) {
 		"EXECUTE: printf marker-output",
 	}, "\n")
 
-	summary, meaningful := applyAgentActions(response, hooks.Load(), &hooks.Variables{})
+	summary, meaningful, _, _ := applyAgentActions(response, hooks.Load(), &hooks.Variables{})
 
 	if meaningful != 2 {
 		t.Fatalf("expected 2 meaningful actions, got %d (summary: %s)", meaningful, summary)

@@ -12,10 +12,14 @@ import (
 	"time"
 
 	"github.com/arcanflows/cli/internal/api"
+	"github.com/arcanflows/cli/internal/ledger"
+	"github.com/arcanflows/cli/internal/gitctx"
+	"github.com/arcanflows/cli/internal/artifacts"
 	"github.com/arcanflows/cli/internal/fileops"
 	"github.com/arcanflows/cli/internal/hooks"
 	"github.com/arcanflows/cli/internal/memory"
 	"github.com/arcanflows/cli/internal/render"
+	"github.com/arcanflows/cli/internal/rules"
 	"github.com/arcanflows/cli/internal/repo"
 	"github.com/arcanflows/cli/internal/session"
 	"github.com/arcanflows/cli/internal/shell"
@@ -52,6 +56,7 @@ Examples:
 func init() {
 	// Chat flags
 	chatCmd.Flags().String("agent", "", "agent slug or name")
+	chatCmd.Flags().BoolVar(&allowDenied, "allow-denied", false, "Bypass [deny] rules for this session (PROPOSAL-010 §6.1)")
 	chatCmd.Flags().String("agent-id", "", "agent ID (UUID)")
 	chatCmd.Flags().String("model", "", "override model for this session")
 	chatCmd.Flags().String("conversation-id", "", "continue existing conversation")
@@ -220,8 +225,25 @@ func runChat(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	// Load layered rules (§6.1): global prose prepends the project
+	// instructions; [deny] entries from BOTH layers are enforced at apply
+	// time in applyAgentActions.
+	activeRules = rules.Load(".")
+	if len(activeRules.Sources) > 0 {
+		render.Info(fmt.Sprintf("Rules loaded (%d source(s), hash %s)", len(activeRules.Sources), activeRules.Hash))
+	}
+
 	// Load project instructions (ARCANFLOWS.md)
 	projectInstructions := loadProjectInstructions()
+	if activeRules.GlobalText != "" {
+		projectInstructions = "# User rules (global)\n" + activeRules.GlobalText + "\n\n" + projectInstructions
+	}
+	// Requirements (§6.2): a co-maintained local artifact, injected bounded.
+	if reqCtx := loadRequirementsContext(); reqCtx != "" {
+		projectInstructions += reqCtx
+	}
+	// Git awareness (§6.5, D3): bounded read-only state.
+	projectInstructions += gitctx.Context()
 
 	// Load project memory
 	memStore, _ := memory.Load()
@@ -332,7 +354,17 @@ func runChat(cmd *cobra.Command, args []string) error {
 					activeSession = session.NewSession(agentID, agentName)
 				}
 				pendingFileContext.Reset()
-				render.Info("Conversation cleared — starting fresh")
+				// Re-arm rules + instructions for the fresh conversation (§6.1):
+				// the new server conversation has none of this context.
+				projectInstructions = loadProjectInstructions()
+				if activeRules.GlobalText != "" {
+					projectInstructions = "# User rules (global)\n" + activeRules.GlobalText + "\n\n" + projectInstructions
+				}
+				if reqCtx := loadRequirementsContext(); reqCtx != "" {
+					projectInstructions += reqCtx
+				}
+				projectInstructions += gitctx.Context()
+				render.Info("Conversation cleared — starting fresh (rules re-armed)")
 				continue
 			case strings.HasPrefix(input, "/file "):
 				// Actually attach the file to the next message (C5) — was discarded.
@@ -464,7 +496,29 @@ func runChat(cmd *cobra.Command, args []string) error {
 			}
 
 			// Apply the agent's local actions and collect their outcomes.
-			summary, meaningful := applyAgentActions(fullResponse, hooksMgr, &hookVars)
+			summary, meaningful, touchedFiles, ranCmds := applyAgentActions(fullResponse, hooksMgr, &hookVars)
+
+			// Usage ledger (§6.3, D2 on-by-default): the API returns token
+			// counts every turn; record them locally with what was touched.
+			ledger.Append(ledger.Entry{
+				Agent:            agentName,
+				ConversationID:   conversationID,
+				PromptTokens:     promptTokens,
+				CompletionTokens: completionTokens,
+				FilesTouched:     touchedFiles,
+				CommandsRun:      ranCmds,
+				DurationSeconds:  elapsed.Seconds(),
+			})
+
+			// Artifact bridge (§6.6): platform outputs land on disk on request.
+			if urls := artifacts.FindURLs(fullResponse, client.BaseURL); len(urls) > 0 {
+				fmt.Fprintf(os.Stderr, "%s  %d artifact link(s) detected in the response%s\n", render.Dim, len(urls), render.Reset)
+				if render.Confirm(fmt.Sprintf("Save %d artifact(s) to ./artifacts/?", len(urls))) {
+					if n, aerr := artifacts.Save(urls, agentName, client.DownloadRaw); aerr == nil {
+						render.Success(fmt.Sprintf("Saved %d artifact(s)", n))
+					}
+				}
+			}
 
 			if activeSession != nil && sessionStore != nil {
 				_ = sessionStore.Save(activeSession)
@@ -492,14 +546,48 @@ func runChat(cmd *cobra.Command, args []string) error {
 // response and returns a human-readable summary plus the count of "meaningful"
 // outcomes — applied or failed. User-skipped actions don't count, so a decline
 // doesn't keep the agent loop nagging (PROPOSAL-010 Phase 1).
-func applyAgentActions(response string, hooksMgr *hooks.Manager, hookVars *hooks.Variables) (string, int) {
+func applyAgentActions(response string, hooksMgr *hooks.Manager, hookVars *hooks.Variables) (string, int, []string, []string) {
 	var lines []string
+	var touched, ran []string
 	meaningful := 0
 
 	ops := fileops.ParseOperations(response)
 	if len(ops) > 0 {
 		fmt.Fprintf(os.Stderr, "\n%s  %d file operation(s) detected%s\n", render.Dim, len(ops), render.Reset)
+
+		// Scaffold mode (§6.7): ≥4 creations → ONE consent decision over the
+		// whole tree instead of a y/n per file. Deny rules are checked
+		// BEFORE the tree is shown; a denied path flags the batch.
+		batchApproved := false
+		if creates := countCreates(ops); creates >= 4 {
+			approved, filtered := scaffoldConsent(ops)
+			if !approved {
+				lines = append(lines, fmt.Sprintf("- scaffold of %d files: rejected by user", creates))
+				return strings.Join(lines, "\n"), 0, nil, nil
+			}
+			ops = filtered
+			batchApproved = true
+			fileops.SetBatch(fmt.Sprintf("scaffold-%d", time.Now().UnixNano()))
+			defer fileops.ClearBatch()
+		}
+
 		for _, op := range ops {
+			// Hard deny tier (§6.1): mechanical, not prompt guidance.
+			if err := activeRules.CheckPath(op.Path); err != nil && !allowDenied {
+				render.Warning(fmt.Sprintf("%s %s: %v", op.Type, op.Path, err))
+				lines = append(lines, fmt.Sprintf("- %s %s: %v (use --allow-denied to override)", op.Type, op.Path, err))
+				meaningful++
+				continue
+			}
+			if op.Type == "rename" && op.NewPath != "" {
+				if err := activeRules.CheckPath(op.NewPath); err != nil && !allowDenied {
+					render.Warning(fmt.Sprintf("rename target %s: %v", op.NewPath, err))
+					lines = append(lines, fmt.Sprintf("- rename %s: target %v", op.NewPath, err))
+					meaningful++
+					continue
+				}
+			}
+			autoConfirmOp := batchApproved
 			hookVars.File = op.Path
 			target := op.Path
 			if op.Type == "rename" {
@@ -520,33 +608,38 @@ func applyAgentActions(response string, hooksMgr *hooks.Manager, hookVars *hooks
 			var opErr error
 			switch op.Type {
 			case "create":
-				opErr = fileops.CreateFile(op.Path, op.Content, false)
+				opErr = fileops.CreateFile(op.Path, op.Content, autoConfirmOp)
 				if opErr == nil {
 					hooksMgr.Run(hooks.PostCreate, *hookVars)
 					sessionAddFile(op.Path)
+					touched = append(touched, op.Path)
 				}
 			case "edit":
-				opErr = fileops.EditFile(op.Path, op.Content, false)
+				opErr = fileops.EditFile(op.Path, op.Content, autoConfirmOp)
 				if opErr == nil {
 					hooksMgr.Run(hooks.PostEdit, *hookVars)
 					sessionAddFile(op.Path)
+					touched = append(touched, op.Path)
 				}
 			case "replace":
-				opErr = fileops.ReplaceInFile(op.Path, op.Replacements, false)
+				opErr = fileops.ReplaceInFile(op.Path, op.Replacements, autoConfirmOp)
 				if opErr == nil {
 					hooksMgr.Run(hooks.PostEdit, *hookVars)
 					sessionAddFile(op.Path)
+					touched = append(touched, op.Path)
 				}
 			case "delete":
-				opErr = fileops.DeleteFile(op.Path, false)
+				opErr = fileops.DeleteFile(op.Path, autoConfirmOp)
 				if opErr == nil {
 					hooksMgr.Run(hooks.PostDelete, *hookVars)
 					sessionAddFile(op.Path)
+					touched = append(touched, op.Path)
 				}
 			case "rename":
-				opErr = fileops.MoveFile(op.Path, op.NewPath, false)
+				opErr = fileops.MoveFile(op.Path, op.NewPath, autoConfirmOp)
 				if opErr == nil {
 					sessionAddFile(op.NewPath)
+					touched = append(touched, op.NewPath)
 				}
 			}
 			if opErr != nil {
@@ -563,6 +656,13 @@ func applyAgentActions(response string, hooksMgr *hooks.Manager, hookVars *hooks
 	if len(shellCmds) > 0 {
 		shellCfg := shell.DefaultConfig()
 		for _, shCmd := range shellCmds {
+			// Hard deny tier for commands (§6.1).
+			if err := activeRules.CheckCommand(shCmd); err != nil && !allowDenied {
+				render.Warning(fmt.Sprintf("$ %s: %v", shCmd, err))
+				lines = append(lines, fmt.Sprintf("- $ %s: %v (use --allow-denied to override)", shCmd, err))
+				meaningful++
+				continue
+			}
 			// pre_run/post_run hooks now fire (C8).
 			hooksMgr.Run(hooks.PreRun, *hookVars)
 			out, code, execErr := shell.Execute(shCmd, shellCfg)
@@ -570,6 +670,7 @@ func applyAgentActions(response string, hooksMgr *hooks.Manager, hookVars *hooks
 			if activeSession != nil {
 				activeSession.AddCommandRun(shCmd)
 			}
+			ran = append(ran, shCmd)
 			switch {
 			case code == -1 && execErr == nil:
 				// user declined at the confirmation prompt — not meaningful
@@ -588,7 +689,7 @@ func applyAgentActions(response string, hooksMgr *hooks.Manager, hookVars *hooks
 		}
 	}
 
-	return strings.Join(lines, "\n"), meaningful
+	return strings.Join(lines, "\n"), meaningful, touched, ran
 }
 
 // sessionAddFile records a modified file in the active session, if any.
@@ -844,4 +945,84 @@ func runGitCmd(args ...string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// ---------------------------------------------------------------------------
+// PROPOSAL-010 Phase 6 helpers
+// ---------------------------------------------------------------------------
+
+// activeRules holds the layered rule set for this chat (loaded in runChat).
+var activeRules *rules.Rules
+
+// allowDenied is the documented [deny] bypass (D1 — --allow-outside precedent).
+var allowDenied bool
+
+// countCreates counts create operations for scaffold-mode detection (§6.7).
+func countCreates(ops []fileops.FileOperation) int {
+	n := 0
+	for _, op := range ops {
+		if op.Type == "create" {
+			n++
+		}
+	}
+	return n
+}
+
+// scaffoldConsent renders the whole tree once and takes ONE decision:
+// approve all / select per file / reject. 25 sequential y/n prompts breed
+// blind-yes habits; one honest look at the tree does not (§6.7).
+func scaffoldConsent(ops []fileops.FileOperation) (bool, []fileops.FileOperation) {
+	fmt.Fprintf(os.Stderr, "\n%sScaffold detected — the agent wants to create this structure:%s\n", render.Bold, render.Reset)
+	anyDenied := false
+	for _, op := range ops {
+		marker := " "
+		note := ""
+		if err := activeRules.CheckPath(op.Path); err != nil {
+			marker = "✗"
+			note = fmt.Sprintf("  %s[%v]%s", render.Dim, err, render.Reset)
+			anyDenied = true
+		}
+		size := ""
+		if op.Type == "create" || op.Type == "edit" {
+			size = fmt.Sprintf(" (%d bytes)", len(op.Content))
+		}
+		fmt.Fprintf(os.Stderr, "  %s %-7s %s%s%s\n", marker, op.Type, op.Path, size, note)
+	}
+	if anyDenied && !allowDenied {
+		fmt.Fprintf(os.Stderr, "%s  ✗-marked paths are blocked by [deny] rules and will be skipped.%s\n", render.Dim, render.Reset)
+	}
+	fmt.Fprintf(os.Stderr, "%sApply this scaffold? [a]ll / [s]elect / [N]one: %s", render.Bold, render.Reset)
+	line, _ := render.ReadLine()
+	answer := strings.ToLower(strings.TrimSpace(line))
+	switch answer {
+	case "a", "all":
+		return true, ops
+	case "s", "select":
+		var kept []fileops.FileOperation
+		for _, op := range ops {
+			fmt.Fprintf(os.Stderr, "  include %s %s? [y/N]: ", op.Type, op.Path)
+			sel, _ := render.ReadLine()
+			if strings.HasPrefix(strings.ToLower(strings.TrimSpace(sel)), "y") {
+				kept = append(kept, op)
+			}
+		}
+		return len(kept) > 0, kept
+	default:
+		return false, nil
+	}
+}
+
+// loadRequirementsContext injects REQUIREMENTS.md (§6.2, D4: visible root
+// file), bounded so a sprawling backlog can't crowd out the conversation.
+func loadRequirementsContext() string {
+	data, err := os.ReadFile("REQUIREMENTS.md")
+	if err != nil {
+		return ""
+	}
+	content := string(data)
+	const cap = 4000
+	if len(content) > cap {
+		content = content[:cap] + "\n…(truncated — full file in REQUIREMENTS.md)"
+	}
+	return "\n\n# Project requirements (REQUIREMENTS.md — you may propose edits to this file)\n" + content
 }

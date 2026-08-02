@@ -24,7 +24,7 @@ go install github.com/arcanflows/cli@latest
 
 ### Download Binary
 
-Download the binary for your platform from [Releases](https://github.com/windconsul/ai-saas-agents/releases):
+Download the binary for your platform from [Releases](https://github.com/windconsul/arcanflows-cli/releases):
 
 | Platform | Architecture | Binary |
 |----------|-------------|--------|
@@ -197,6 +197,10 @@ EXECUTE: npm install express
 
 **Agentic loop:** after you approve and the CLI applies file edits or runs commands, their results (exit codes, output, errors) are sent back to the agent automatically, and it continues — so it can build, see a failure, and fix it within a single turn. The loop is bounded by `chat_max_tool_iterations` (default 8) and stops as soon as the agent has no more actions. Press **Ctrl+C** to cancel the current turn and return to the prompt.
 
+**Scaffold mode:** when the agent proposes a whole project structure (4 or more new files in one response), the CLI switches from per-file prompts to a single decision — it renders the full directory tree with file sizes and asks once (apply all / select individually / reject). The batch is journaled as one group, so a single `/undo` reverses the entire scaffold.
+
+**Artifact bridge:** when an agent's answer links to platform-generated files (documents, images, media), the CLI offers to download them into `./artifacts/` with a `manifest.jsonl` recording what came from where.
+
 Both require confirmation before execution. File operations are **confined to the project directory** by default (use `--allow-outside` to override), and protected paths (`.env*`, `*.key`, `*.pem`, `*.p8`, `id_rsa`, `credentials*`, `secrets*`, the `.git` tree, …) are never modified. The confirmation prompt is the real safety boundary — review each action before approving.
 
 ### Ask
@@ -302,6 +306,69 @@ arcanflows org switch <tenant-id>               # Switch by ID
 ```
 
 Aliases: `tenant`, `organization`
+
+### Rules
+
+User rules the agent must follow — and, for the `[deny]` section, rules the **CLI itself enforces** regardless of what the agent says. Two layers, both auto-loaded into every chat:
+
+- `~/.arcanflows/RULES.md` — your rules, every project
+- `.arcanflows/RULES.md` — this project's rules (loaded second, so it wins on conflict)
+
+```bash
+arcanflows rules                    # Show effective rules and enforced [deny] entries
+```
+
+Everything outside `[deny]` is prose sent to the agent as instructions. Entries under a `[deny]` heading are **mechanically enforced by the CLI**: matching file operations and shell commands are refused before the confirmation prompt is ever shown, even if the agent proposes them.
+
+```markdown
+# My rules
+Always use TypeScript strict mode.
+Prefer small, focused commits.
+
+[deny]
+path: *.env*
+path: infra/prod/**
+command: kubectl
+command: terraform apply
+```
+
+`path:` entries are glob-matched against the file path (and basename); `dir/**` covers a whole tree. `command:` entries are substring-matched against proposed shell commands. Bypass for one session with `arcanflows chat --allow-denied` (a loud choice, by design).
+
+### Requirements
+
+A living `REQUIREMENTS.md` checklist the agent sees on every turn — what you're building, tracked as checkboxes in a file you both share.
+
+```bash
+arcanflows req add "Login page with OAuth"    # Append - [ ] item
+arcanflows req list                           # Numbered list with status
+arcanflows req done 3                         # Check item 3 off
+```
+
+The file is plain markdown — edit it by hand freely; the agent reads it (first 4 KB) as part of its project context.
+
+### Usage Log
+
+Every chat turn is recorded locally in `.arcanflows/usage.jsonl`: agent, tokens in/out, files touched, commands run, duration. Nothing leaves your disk.
+
+```bash
+arcanflows log                      # Full development log for this project
+arcanflows log --since 7d           # Last week (also 24h, 90m)
+```
+
+Ends with totals: turns, prompt + completion tokens, unique files, commands.
+
+### Commit
+
+Agent-drafted commit messages from your **real diff**. The CLI sends the staged diff (or the working diff if nothing is staged, committing with `-a`), the agent drafts a conventional-commit message, you confirm, git commits. `pre_commit` / `post_commit` hooks fire around it.
+
+```bash
+arcanflows commit                   # Draft from diff, confirm, commit
+arcanflows commit --agent reviewer  # Use a specific agent to draft
+```
+
+### Git Context
+
+Inside a git repository, every chat turn automatically includes a bounded read-only snapshot — current branch, `status --short` (first 30 lines), `diff --stat` (first 20 lines) — so the agent knows the state of your work without you pasting it.
 
 ---
 
@@ -571,16 +638,21 @@ docker run -it \
 ~/.arcanflows/
   config.yaml              # CLI configuration
   credentials.yaml         # Auth tokens (0600 permissions)
+  RULES.md                 # Global user rules (auto-loaded, [deny] enforced)
   history/
     sessions/              # Saved chat sessions
 
 .arcanflows/               # Per-project directory
+  RULES.md                 # Project rules (auto-loaded, wins over global)
+  usage.jsonl              # Local usage ledger (arcanflows log)
   memory/
     project.yaml           # Persistent context entries
   hooks.yaml               # Pre/post command hooks
   backups/                 # File backups before edits
 
 ARCANFLOWS.md              # Project instructions (auto-loaded)
+REQUIREMENTS.md            # Requirements checklist (auto-loaded, arcanflows req)
+artifacts/                 # Downloaded platform artifacts + manifest.jsonl
 ```
 
 ---
@@ -625,6 +697,7 @@ API keys are scoped to a single tenant and inherit the creating user's permissio
 - Agent file operations are **confined to the project directory** (`../`, absolute paths, and symlink escapes are rejected unless `--allow-outside` is passed)
 - Protected paths (`.env*`, `*.key`, `*.pem`, `*.p8`, `id_rsa`/`id_ed25519`, `credentials*`, `secrets*`, `.npmrc`, `.netrc`, the `.git` tree) cannot be modified, deleted, or moved by agents
 - Blocked commands (`rm -rf /`, `shutdown`, etc.) are a **best-effort speed bump, not a security boundary** — a creative command can bypass the substring blocklist, so the confirmation prompt is what actually protects you. Never run with auto-confirm on untrusted input.
+- `[deny]` rules in `RULES.md` add a user-controlled enforcement tier on top: denied paths and commands are refused by the CLI before any prompt, and bypassing requires the explicit `--allow-denied` flag
 - Command and hook output is capped (1 MiB) so a runaway process can't exhaust memory
 - Before `repo analyze`/`review`/`audit` upload file contents for analysis, a best-effort **secret-redaction pass** replaces detected keys/tokens/private-key blocks with `[REDACTED]` (on top of `.gitignore`); the count of redactions is reported
 - Hook commands run with a 30-second timeout; interpolated variables (e.g. `{{file}}`) are shell-quoted to prevent injection

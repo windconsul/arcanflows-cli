@@ -401,15 +401,24 @@ type journalEntry struct {
 	Path     string `json:"path"`               // resulting file (new path for move/create)
 	OrigPath string `json:"orig_path,omitempty"` // move: the original path
 	Backup   string `json:"backup,omitempty"`    // snapshot of prior content (empty for create)
+	Batch    string `json:"batch,omitempty"`     // scaffold-mode group id — /undo reverses the whole batch (§6.7)
 	Time     string `json:"time"`
 }
+
+// currentBatch groups journal entries written while a scaffold batch is
+// active, so one /undo reverses the whole approved tree.
+var currentBatch string
+
+// SetBatch begins grouping journal entries; ClearBatch ends it.
+func SetBatch(id string)  { currentBatch = id }
+func ClearBatch()         { currentBatch = "" }
 
 func journalPath() string { return filepath.Join(backupDir, "journal.jsonl") }
 
 // recordOp appends a reversible operation to the journal (PROPOSAL-010 C16).
 func recordOp(opType, path, origPath, backup string) {
 	_ = os.MkdirAll(backupDir, 0755)
-	entry := journalEntry{Type: opType, Path: path, OrigPath: origPath, Backup: backup, Time: time.Now().Format(time.RFC3339Nano)}
+	entry := journalEntry{Type: opType, Path: path, OrigPath: origPath, Backup: backup, Batch: currentBatch, Time: time.Now().Format(time.RFC3339Nano)}
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return
@@ -442,29 +451,30 @@ func UndoLast() error {
 		return fmt.Errorf("corrupt undo journal")
 	}
 
-	switch last.Type {
-	case "create":
-		if err := os.Remove(last.Path); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("undo create: %w", err)
+	// Scaffold batches undo as a unit (§6.7): walk backwards while entries
+	// share the batch id, undoing each; the journal is rewritten below.
+	if last.Batch != "" {
+		count := 0
+		for i := idx; i >= 0; i-- {
+			var e journalEntry
+			if json.Unmarshal([]byte(lines[i]), &e) != nil || e.Batch != last.Batch {
+				break
+			}
+			if err := undoEntry(e); err != nil {
+				return fmt.Errorf("batch undo stopped at %s: %w", e.Path, err)
+			}
+			count++
+			idx = i - 1
 		}
-		render.Success(fmt.Sprintf("Removed %s (undo create)", last.Path))
-	case "move":
-		if err := os.Rename(last.Path, last.OrigPath); err != nil {
-			return fmt.Errorf("undo move: %w", err)
+		if err := os.WriteFile(journalPath(), []byte(strings.Join(lines[:idx+1], "\n")+"\n"), 0644); err != nil {
+			return fmt.Errorf("rewriting journal: %w", err)
 		}
-		render.Success(fmt.Sprintf("Moved back %s -> %s", last.Path, last.OrigPath))
-	default: // edit, replace, delete
-		if last.Backup == "" {
-			return fmt.Errorf("no backup available to undo %s of %s", last.Type, last.Path)
-		}
-		content, err := os.ReadFile(last.Backup)
-		if err != nil {
-			return fmt.Errorf("reading backup: %w", err)
-		}
-		if err := writeFileAtomic(last.Path, content, fileMode(last.Path)); err != nil {
-			return fmt.Errorf("restoring file: %w", err)
-		}
-		render.Success(fmt.Sprintf("Restored %s (undo %s)", last.Path, last.Type))
+		render.Success(fmt.Sprintf("Undid scaffold batch (%d operations)", count))
+		return nil
+	}
+
+	if err := undoEntry(last); err != nil {
+		return err
 	}
 
 	// Drop the undone entry from the journal.
@@ -663,4 +673,34 @@ func formatSize(b int64) string {
 		return fmt.Sprintf("%d B", b)
 	}
 	return fmt.Sprintf("%.1f KB", float64(b)/1024)
+}
+
+
+// undoEntry reverses one journal entry (shared by single and batch undo).
+func undoEntry(e journalEntry) error {
+	switch e.Type {
+	case "create":
+		if err := os.Remove(e.Path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("undo create: %w", err)
+		}
+		render.Success(fmt.Sprintf("Removed %s (undo create)", e.Path))
+	case "move":
+		if err := os.Rename(e.Path, e.OrigPath); err != nil {
+			return fmt.Errorf("undo move: %w", err)
+		}
+		render.Success(fmt.Sprintf("Moved back %s -> %s", e.Path, e.OrigPath))
+	default: // edit, replace, delete
+		if e.Backup == "" {
+			return fmt.Errorf("no backup available to undo %s of %s", e.Type, e.Path)
+		}
+		content, err := os.ReadFile(e.Backup)
+		if err != nil {
+			return fmt.Errorf("reading backup: %w", err)
+		}
+		if err := writeFileAtomic(e.Path, content, fileMode(e.Path)); err != nil {
+			return fmt.Errorf("restoring file: %w", err)
+		}
+		render.Success(fmt.Sprintf("Restored %s (undo %s)", e.Path, e.Type))
+	}
+	return nil
 }
