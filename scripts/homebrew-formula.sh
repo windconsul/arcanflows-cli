@@ -51,7 +51,9 @@ class Arcanflows < Formula
   def install
     os = OS.mac? ? "darwin" : "linux"
     arch = Hardware::CPU.arm? ? "arm64" : "amd64"
-    bin.install "arcanflows-#{os}-#{arch}" => "arcanflows"
+    binary = "arcanflows-#{os}-#{arch}"
+    chmod 0755, binary # a raw release asset downloads without the execute bit
+    bin.install binary => "arcanflows"
     generate_completions_from_executable(bin/"arcanflows", "completion")
   end
 
