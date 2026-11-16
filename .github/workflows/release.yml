@@ -104,8 +104,29 @@ jobs:
               ARCANFLOWS_CLI_INSTALL_DIR="$HOME/.local/bin" sh
             ```
 
+            ### Homebrew (macOS / Linux)
+
+            ```sh
+            brew tap windconsul/arcanflows-cli https://github.com/windconsul/arcanflows-cli
+            brew install windconsul/arcanflows-cli/arcanflows
+            ```
+
             ### Verify
             ```sh
             sha256sum -c checksums.txt
             arcanflows --help
             ```
+
+      # The formula on main must point at the newest release with real
+      # SHA-256 sums; generating it here means it can never go stale.
+      - name: Update the Homebrew formula on main
+        run: |
+          git fetch --depth 1 origin main
+          git checkout -B main origin/main
+          scripts/homebrew-formula.sh "$GITHUB_REF_NAME" dist/checksums.txt > Formula/arcanflows.rb
+          if git diff --quiet -- Formula/arcanflows.rb; then echo "formula already current"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/arcanflows.rb
+          git commit -m "chore: Homebrew formula for $GITHUB_REF_NAME"
+          git push origin main
