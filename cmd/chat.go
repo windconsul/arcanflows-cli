@@ -343,8 +343,26 @@ func runChat(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
+		// PROPOSAL-121 S1: a user-defined command (/name args) becomes the
+		// next message, rendered from its prompt file.
+		customHandled := false
+		if strings.HasPrefix(input, "/") && input != "/exit" && input != "/quit" {
+			if rendered, ok := expandCustomCommand(client, agentID, input); ok {
+				if rendered == "" {
+					continue
+				}
+				input, customHandled = rendered, true
+			}
+		}
+
 		// Handle in-session commands
-		if strings.HasPrefix(input, "/") {
+		if strings.HasPrefix(input, "/") && !customHandled {
+			// Checked first: handleChatCommand answers every other /word, so an
+			// exit check placed after it never ran.
+			if input == "/exit" || input == "/quit" {
+				saveSessionOnExit()
+				return nil
+			}
 			// State-mutating commands need runChat scope (conversationID, pending).
 			switch {
 			case input == "/clear":
@@ -380,10 +398,6 @@ func runChat(cmd *cobra.Command, args []string) error {
 			}
 			if handleChatCommand(input) {
 				continue
-			}
-			if input == "/exit" || input == "/quit" {
-				saveSessionOnExit()
-				return nil
 			}
 		}
 
@@ -771,13 +785,7 @@ func runAsk(cmd *cobra.Command, args []string) error {
 	// Stream response
 	return client.ChatStream(agentID, api.ChatRequest{
 		Message: question,
-	}, func(chunk api.StreamChunk) {
-		if chunk.Delta != "" {
-			fmt.Print(chunk.Delta)
-		} else if chunk.Content != "" && chunk.Done {
-			fmt.Print(chunk.Content)
-		}
-	})
+	}, printAnswer())
 }
 
 // handleChatCommand processes in-session / commands. Returns true if handled.
@@ -818,6 +826,7 @@ func handleChatCommand(input string) bool {
 		fmt.Fprintln(os.Stderr, "    /hooks            Show configured hooks")
 		fmt.Fprintln(os.Stderr, "    /clear            Clear conversation")
 		fmt.Fprintln(os.Stderr, "    /exit             Exit chat")
+		printCustomCommandsHelp()
 		fmt.Fprintln(os.Stderr, "")
 		return true
 	case "/sessions":

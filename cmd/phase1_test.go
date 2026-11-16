@@ -2,10 +2,12 @@ package cmd
 
 import (
 	"bufio"
+	"io"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/arcanflows/cli/internal/api"
 	"github.com/arcanflows/cli/internal/hooks"
 	"github.com/arcanflows/cli/internal/render"
 )
@@ -62,4 +64,40 @@ func TestBuildToolResultMessageRestatesGoal(t *testing.T) {
 	if !strings.Contains(msg2, "…") {
 		t.Errorf("expected long original request to be truncated")
 	}
+}
+
+// PROPOSAL-121 S1: the done event repeats the whole answer; printing it after
+// the deltas doubled every reply from ask and run.
+func TestPrintAnswerPrintsOnce(t *testing.T) {
+	out := captureStdout(t, func() {
+		p := printAnswer()
+		p(api.StreamChunk{Delta: "Hel"})
+		p(api.StreamChunk{Delta: "lo"})
+		p(api.StreamChunk{Done: true, Content: "Hello"})
+	})
+	if out != "Hello" {
+		t.Fatalf("streamed answer printed as %q", out)
+	}
+	out = captureStdout(t, func() {
+		p := printAnswer()
+		p(api.StreamChunk{Done: true, Content: "Only final"})
+	})
+	if out != "Only final" {
+		t.Fatalf("non-streamed answer printed as %q", out)
+	}
+}
+
+func captureStdout(t *testing.T, f func()) string {
+	t.Helper()
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	f()
+	w.Close()
+	os.Stdout = old
+	b, _ := io.ReadAll(r)
+	return string(b)
 }

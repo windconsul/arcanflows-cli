@@ -214,6 +214,40 @@ git diff | arcanflows ask "Review this diff"
 arcanflows ask --agent security-expert "Check this for vulnerabilities"
 ```
 
+### Your Commands
+
+Save prompts you use often as commands and run them as `/name` inside `arcanflows chat`, or as `arcanflows run name` from the shell.
+
+```bash
+arcanflows commands init               # add the starter set to this project
+arcanflows commands init --user        # … or to ~/.arcanflows/commands for every project
+arcanflows commands new standup        # create .arcanflows/commands/standup.md from a scaffold
+arcanflows commands list
+arcanflows commands show review
+arcanflows run weekly-report 2026-W46
+git diff | arcanflows run review "focus on security"
+```
+
+A command is a Markdown file in `.arcanflows/commands/` (this project) or `~/.arcanflows/commands/` (every project); a project command wins over a user command with the same name, and built-in chat commands (`/help`, `/exit` …) cannot be replaced.
+
+```markdown
+---
+description: Weekly sales report from the CRM table
+argument-hint: "[week]"
+agent: sales-analyst        # optional: this agent answers (default: the chat's agent)
+---
+Build the weekly sales report for $ARGUMENTS. Compare with the previous week
+and end with three actions.
+```
+
+- `$ARGUMENTS` is everything after the command name; `$1` … `$9` are single words (`"quoted phrases"` count as one). With no placeholder, the arguments are added after the prompt.
+- Inside `chat`, a command for the chat's own agent becomes your next message; a command for another agent is answered once, outside the conversation.
+- `run` adds piped input to the arguments. Input that has not started arriving within half a second is skipped so scripts never hang; pass `--stdin` to wait for a slow producer.
+- The frontmatter matches Claude Code command files, so those mostly work as they are. Keys with no meaning here (`allowed-tools`, `model` …) are ignored with a warning: the agent always answers with its own model.
+- Commands are text. Nothing in a command file runs on your machine.
+
+Starter set: `/plan`, `/review`, `/quality-gate`, `/research`, `/weekly-report`, `/triage-inbox`, `/draft-agreement`, `/handoff-summary`.
+
 ### Agents
 
 ```bash
@@ -722,4 +756,11 @@ Common issues:
 
 ## License
 
-Copyright 2024-2026 ArcanFlows. All rights reserved.
+Copyright © 2024–2026 **Windconsul Tech LLC**. All rights reserved.
+
+ARCANFLOWS™ is a trademark of Windconsul Tech LLC.
+759 Hadley Ln NE, Marietta, GA 30068, United States
+
+Proprietary software — see [LICENSE](LICENSE) for the terms, and
+[arcanflows.com/licenses](https://arcanflows.com/licenses) for the platform's
+license overview and third-party components.
