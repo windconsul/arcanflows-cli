@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -100,4 +101,29 @@ func captureStdout(t *testing.T, f func()) string {
 	os.Stdout = old
 	b, _ := io.ReadAll(r)
 	return string(b)
+}
+
+func TestSplitSkillArgs(t *testing.T) {
+	in, text := splitSkillArgs(`topic="EV batteries" depth=2 focus on suppliers`)
+	if in["topic"] != "EV batteries" || in["depth"] != "2" || text != "focus on suppliers" {
+		t.Fatalf("inputs %v text %q", in, text)
+	}
+	if in, text := splitSkillArgs("no inputs here"); len(in) != 0 || text != "no inputs here" {
+		t.Fatalf("inputs %v text %q", in, text)
+	}
+}
+
+func TestSkillMatchesAndErrorMessage(t *testing.T) {
+	sk := &api.Skill{ID: "11111111-2222-3333-4444-555555555555", Slug: "research-brief-1790865620", Name: "Research Brief"}
+	for _, ref := range []string{"research-brief", "Research Brief", "RESEARCH-BRIEF-1790865620", "11111111-2222-3333-4444-555555555555"} {
+		if !api.SkillMatches(sk, ref) {
+			t.Errorf("%q should match", ref)
+		}
+	}
+	if api.SkillMatches(sk, "research") {
+		t.Error("a bare prefix without the dash boundary must not match")
+	}
+	if got := api.ErrorMessage(fmt.Errorf(`API error 422: {"error":"missing required inputs for \"x\": topic","code":"SKILL_RUN_REFUSED"}`)); got != `missing required inputs for "x": topic` {
+		t.Fatalf("got %q", got)
+	}
 }

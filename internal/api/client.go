@@ -325,13 +325,22 @@ type AgentListResponse struct {
 	Total  int     `json:"total"`
 }
 
-// ListAgents returns all agents for the current tenant.
+// ListAgents returns all agents for the current tenant. The API pages
+// (at most 100 a page); reading only the first page made --agent <name> fail
+// for every agent past it in larger workspaces.
 func (c *Client) ListAgents() ([]Agent, error) {
-	var result AgentListResponse
-	if err := c.Get("/api/v1/agents", &result); err != nil {
-		return nil, err
+	var all []Agent
+	for page := 1; page <= 100; page++ {
+		var result AgentListResponse
+		if err := c.Get(fmt.Sprintf("/api/v1/agents?per_page=100&page=%d", page), &result); err != nil {
+			return nil, err
+		}
+		all = append(all, result.Agents...)
+		if len(result.Agents) < 100 || (result.Total > 0 && len(all) >= result.Total) {
+			break
+		}
 	}
-	return result.Agents, nil
+	return all, nil
 }
 
 // GetAgent returns a single agent by ID.

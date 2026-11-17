@@ -6,7 +6,7 @@
 //	description: Weekly sales report from the CRM table
 //	argument-hint: "[week]"
 //	agent: sales-analyst   # optional: agent slug, name or id
-//	skill: data-report     # optional: run this platform skill instead of a chat turn
+//	skill: data-report     # optional: run this platform skill (name=value args are its inputs)
 //	model:                 # optional model override
 //	---
 //	Build the weekly sales report for $ARGUMENTS.
@@ -232,7 +232,7 @@ func Scaffold(name string) string {
 description: What /%s does, in one line
 argument-hint: "[what to pass]"
 # agent: my-agent        # optional: send to this agent (slug, name or id)
-# skill: data-report     # optional: run this platform skill instead
+# skill: data-report     # optional: run this platform skill instead (name=value args are its inputs)
 ---
 Write the prompt here. $ARGUMENTS is replaced by everything after /%s;
 $1, $2 … by single words.

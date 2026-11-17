@@ -202,15 +202,18 @@ Examples:
 		if stdin := readPipedStdin(waitStdin); stdin != "" {
 			input = strings.TrimSpace(input + "\n\n" + stdin)
 		}
-		if c.Skill != "" {
-			return fmt.Errorf("/%s runs the skill %q — skill commands need \"arcanflows skills run\", which is not in this version yet", c.Name, c.Skill)
-		}
 		warnUnsupported(c)
 		client := requireAuth()
 		agentFlag, _ := cmd.Flags().GetString("agent")
 		agentIDFlag, _ := cmd.Flags().GetString("agent-id")
 		if agentFlag == "" && agentIDFlag == "" {
 			agentFlag = c.Agent
+		}
+		if c.Skill != "" {
+			// name=value words are the skill's inputs; the rendered prompt is
+			// its source material.
+			inputs, text := splitSkillArgs(input)
+			return runSkill(client, c.Skill, agentFlag, agentIDFlag, inputs, c.Render(text), false, false)
 		}
 		agentID, _, err := resolveAgentID(client, agentFlag, agentIDFlag)
 		if err != nil {
@@ -302,11 +305,18 @@ func expandCustomCommand(client *api.Client, currentAgentID, input string) (rend
 	if !found {
 		return "", false
 	}
+	warnUnsupported(c)
 	if c.Skill != "" {
-		render.Warning(fmt.Sprintf("/%s runs the skill %q — skill commands need \"arcanflows skills run\", which is not in this version yet", c.Name, c.Skill))
+		inputs, text := splitSkillArgs(args)
+		agentFlag, agentIDFlag := c.Agent, ""
+		if agentFlag == "" {
+			agentIDFlag = currentAgentID
+		}
+		if err := runSkill(client, c.Skill, agentFlag, agentIDFlag, inputs, c.Render(text), false, false); err != nil {
+			render.Error(fmt.Sprintf("/%s: %v", c.Name, err))
+		}
 		return "", true
 	}
-	warnUnsupported(c)
 	prompt := c.Render(args)
 	if c.Agent != "" {
 		targetID, targetName, err := resolveAgentID(client, c.Agent, "")
